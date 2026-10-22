@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "astock-quant": {
+      "command": "/Users/meng/测试/.venv/bin/python",
+      "args": ["/Users/meng/测试/量化工具/mcp_server.py"]
+    }
+  }
+}
