@@ -9,7 +9,7 @@
 - 可选买侧强化：一谷 ∧ 近 3～5 日底背离（复用 lib.patterns.pattern_底背离_简化）
 - 可选买侧缩量：换手率%（基本面缓存 turn / 新浪 turnoverratio）< 阈值（默认 1.0，可 0.5）；可与底背离叠加
 - 一峰（卖观察）：分位 ≥70%（卖侧不加形态 AND）
-- 参考价：最新收盘（若有实时价则优先实时）
+- 参考价：最新收盘；有实时价则当作今天这根 K，分位/目标价/分档都按它重算（close_with_live）
 - 目标买入价（历史分位映射，非预测必成交价）：
   * buy_ceiling = 近3年过去收盘的 30% 分位价（一谷上沿 / 目标买入上限）
   * buy_prefer  = 20% 分位价（建议分批更优价）
@@ -20,6 +20,8 @@
 """
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -29,6 +31,7 @@ import pandas as pd
 VALLEY = 0.30
 PEAK = 0.70
 PREFER = 0.20  # 建议分批价分位
+DEEP = 0.10  # 深谷：回放里 20/60 日都不如 10–30%，标慎接
 ROLL = 750
 MIN_OBS = 500
 
@@ -133,8 +136,10 @@ def compute_target_levels(
 
     target_buy = None
     target_note = None
-    if np.isfinite(buy_ceiling) and np.isfinite(px):
-        if px <= buy_ceiling + 1e-9:
+    hist = _past_hist(close, window=window, min_obs=min_obs)
+    if np.isfinite(buy_ceiling) and np.isfinite(px) and hist is not None:
+        # 「已在一谷」与分档同一判据（分位≤valley）；并列价时 px==上限也可能分位>30%
+        if float(np.mean(hist <= px)) <= valley:
             target_buy = round(px, 4)
             target_note = "现价已在一谷"
         else:
@@ -155,18 +160,69 @@ def compute_target_levels(
     }
 
 
-def refresh_target_buy(sig: GuFengSignal) -> GuFengSignal:
-    """After live price update: recompute target_buy / note vs frozen buy_ceiling."""
-    if sig.buy_ceiling is None or not np.isfinite(sig.buy_ceiling):
-        return sig
-    px = float(sig.price)
-    if px <= float(sig.buy_ceiling) + 1e-9:
-        sig.target_buy = round(px, 4)
-        sig.target_note = "现价已在一谷"
-    else:
-        sig.target_buy = round(float(sig.buy_ceiling), 4)
-        sig.target_note = "待回落至一谷上沿"
-    return sig
+def live_quote(q: Optional[dict]) -> Tuple[Optional[float], str]:
+    """新浪快照 → (价格, 日期)。停牌时新浪给 price=0，按无实时价处理。"""
+    if not q:
+        return None, ""
+    try:
+        px = float(q.get("price") or q.get("px"))
+    except (TypeError, ValueError):
+        return None, ""
+    if not np.isfinite(px) or px <= 0:
+        return None, ""
+    return px, str(q.get("date") or "")[:10]
+
+
+def close_with_live(
+    dates: Sequence[str],
+    close: np.ndarray,
+    live_px: Optional[float] = None,
+    live_date: str = "",
+) -> Tuple[np.ndarray, str]:
+    """把实时价并成「今天这根 K」：分位、目标价、分档都用同一个价，避免参考价是实时、分位却按昨收。
+
+    缓存已有当日 K（或快照没带日期）→ 替换最后一根；快照日期更新 → 追加一根；快照比缓存旧 → 不用。
+    """
+    last = str(dates[-1])[:10]
+    if live_px is None or not np.isfinite(live_px) or live_px <= 0:
+        return close, last
+    ld = (live_date or "")[:10]
+    if ld and ld < last:
+        return close, last
+    if not ld or ld == last:
+        c = close.copy()
+        c[-1] = float(live_px)
+        return c, last
+    return np.append(close, float(live_px)), ld
+
+
+def assess(
+    df: pd.DataFrame,
+    *,
+    live_px: Optional[float] = None,
+    live_date: str = "",
+    valley: float = VALLEY,
+    peak: float = PEAK,
+) -> Optional[Dict[str, Any]]:
+    """单票分位 + 分档 + 目标价（扫描与单票查询共用同一口径）。中间区 zone=mid。"""
+    if df is None or len(df) < MIN_OBS + 5 or "close" not in df.columns:
+        return None
+    d = df if df["date"].is_monotonic_increasing else df.sort_values("date")
+    close, asof = close_with_live(
+        d["date"].astype(str).tolist(), d["close"].astype(float).to_numpy(), live_px, live_date
+    )
+    vp = latest_past_percentile(close)
+    if not np.isfinite(vp):
+        return None
+    px = float(close[-1])
+    zone = "buy" if vp <= valley else ("sell" if vp >= peak else "mid")
+    return {
+        "zone": zone,
+        "val_pct": vp,
+        "price": px,
+        "asof": asof,
+        "levels": compute_target_levels(close, px, valley=valley, peak=peak),
+    }
 
 
 def score_symbol(
@@ -178,21 +234,24 @@ def score_symbol(
     live_px: Optional[float] = None,
     valley: float = VALLEY,
     peak: float = PEAK,
+    live_date: str = "",
 ) -> Optional[GuFengSignal]:
-    if df is None or len(df) < MIN_OBS + 5:
+    a = assess(df, live_px=live_px, live_date=live_date, valley=valley, peak=peak)
+    return signal_from_assess(a, sym, name=name, pe=pe, pb=pb, valley=valley, peak=peak)
+
+
+def signal_from_assess(
+    a: Optional[Dict[str, Any]],
+    sym: str,
+    name: str = "",
+    pe: Optional[float] = None,
+    pb: Optional[float] = None,
+    valley: float = VALLEY,
+    peak: float = PEAK,
+) -> Optional[GuFengSignal]:
+    if a is None or a["zone"] == "mid":
         return None
-    d = df
-    if "close" not in d.columns:
-        return None
-    if not d["date"].is_monotonic_increasing:
-        d = d.sort_values("date")
-    close = d["close"].astype(float).to_numpy()
-    vp = latest_past_percentile(close)
-    if not np.isfinite(vp):
-        return None
-    last_date = str(d["date"].iloc[-1])[:10]
-    px = float(live_px) if live_px is not None and np.isfinite(live_px) else float(close[-1])
-    levels = compute_target_levels(close, px, valley=valley, peak=peak)
+    vp, px, last_date, levels = a["val_pct"], a["price"], a["asof"], a["levels"]
     if vp <= valley:
         side = "buy"
     elif vp >= peak:
@@ -226,10 +285,13 @@ def scan_universe(
     live: Optional[Dict[str, dict]] = None,
     min_bars: int = 280,
     progress_every: int = 200,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[GuFengSignal], List[GuFengSignal]]:
+    """stats 传入 dict 时写回 n_scored（能算出分位的票数，含中间区），供一谷占比做分母。"""
     from lib.data import _read_fund_raw, is_mainboard_a, is_st_name, load_kline_csv, resolve_name
 
     buys: List[GuFengSignal] = []
+    n_scored = 0
     sells: List[GuFengSignal] = []
     fund = fund or {}
     live = live or {}
@@ -242,6 +304,9 @@ def scan_universe(
         raw_rec = raw_fund.get(sym) or {}
         seed_name = str(raw_rec.get("name") or f.get("name") or "")
         name = resolve_name(sym, seed_name, raw_fund or fund)
+        q = live.get(sym) or {}
+        # 实时简称比缓存新（刚戴帽的 ST 缓存里可能还是旧名）
+        name = str(q.get("name") or "").strip() or name
         if raw_rec.get("st") or is_st_name(name):
             continue
         df = load_kline_csv(sym, min_bars=min_bars)
@@ -257,13 +322,11 @@ def scan_universe(
             pb = float(pb) if pb is not None else None
         except (TypeError, ValueError):
             pb = None
-        live_px = None
-        if sym in live:
-            try:
-                live_px = float(live[sym].get("price") or live[sym].get("px"))
-            except (TypeError, ValueError):
-                live_px = None
-        sig = score_symbol(df, sym, name=name, pe=pe, pb=pb, live_px=live_px, valley=valley, peak=peak)
+        live_px, live_date = live_quote(q)
+        a = assess(df, live_px=live_px, live_date=live_date, valley=valley, peak=peak)
+        if a is not None:
+            n_scored += 1
+        sig = signal_from_assess(a, sym, name=name, pe=pe, pb=pb, valley=valley, peak=peak)
         if sig is None:
             continue
         # soft PE sanity: skip obvious garbage PE for buy list display
@@ -278,7 +341,78 @@ def scan_universe(
             print(f"  …已扫 {i+1}/{len(symbols)}  买={len(buys)} 卖={len(sells)}", flush=True)
     buys.sort(key=lambda s: s.val_pct)
     sells.sort(key=lambda s: -s.val_pct)
+    if stats is not None:
+        stats["n_scored"] = n_scored
     return buys, sells
+
+
+def row_val_pct(row: Dict[str, Any]) -> Optional[float]:
+    v = _parse_float(row.get("val_pct"))
+    if v is not None:
+        return v
+    v = _parse_float(row.get("val_pct_pct"))
+    return None if v is None else v / 100.0
+
+
+def buy_label(divergence: Optional[bool], val_pct: Optional[float]) -> str:
+    """一谷∩底背离 才升「强化买入」；深谷不升级：回放里深谷∩底背离 60 日仍平均跑输同日约 2%。"""
+    if divergence and caution_of(True, val_pct) is None:
+        return "强化买入"
+    return "买入观察"
+
+
+def caution_of(is_buy: bool, val_pct: Optional[float]) -> Optional[str]:
+    if is_buy and val_pct is not None and np.isfinite(val_pct) and val_pct <= DEEP:
+        return "深谷·慎接"
+    return None
+
+
+# 数字来自 scripts/research_gufeng_long.py 十年回放（2014-02～2026-10，次日开盘买、涨5%就卖、最多40天、扣成本）
+_BREADTH_TIERS = (
+    (0.20, "low", "一谷票少（大盘偏高）：十年回放里这档一谷票40天内涨到5%的占61%，平均每笔略亏0.3%，谨慎"),
+    (0.40, "mid", "中性：十年回放里这档一谷票40天内涨到5%的占67%，平均每笔+0.8%"),
+    (9.99, "high", "一谷票多（普跌后）：十年回放里这档一谷票40天内涨到5%的占74%，平均每笔+1.0%，没涨到的平均亏10%"),
+)
+
+
+def breadth_info(n_buy: Optional[int], n_scored: Optional[int]) -> Optional[Dict[str, Any]]:
+    """全市场一谷占比 = 一谷票数 / 能算出分位的票数（与回放同口径）。只作参考，不筛票。"""
+    try:
+        nb, ns = int(n_buy), int(n_scored)
+    except (TypeError, ValueError):
+        return None
+    if ns <= 0:
+        return None
+    share = nb / ns
+    for upper, tier, text in _BREADTH_TIERS:
+        if share < upper:
+            break
+    return {"share": round(share, 4), "n_buy": nb, "n_scored": ns, "tier": tier, "text": text}
+
+
+def meta_path_for(all_csv_path: str) -> str:
+    d, f = os.path.split(all_csv_path)
+    return os.path.join(d, f.replace("gufeng_all_", "gufeng_meta_").replace(".csv", ".json"))
+
+
+def write_meta(all_csv_path: str, meta: Dict[str, Any]) -> str:
+    p = meta_path_for(all_csv_path)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+    return p
+
+
+def read_meta(all_csv_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not isinstance(all_csv_path, str):
+        return None
+    p = meta_path_for(all_csv_path)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 TARGET_CSV_FIELDS = [
@@ -310,12 +444,13 @@ def signals_to_rows(sigs: Sequence[GuFengSignal]) -> List[Dict[str, Any]]:
             "target_buy": s.target_buy,
             "target_note": s.target_note,
             "sell_floor": s.sell_floor,
+            "caution": caution_of(s.side == "buy", s.val_pct),
         }
         if s.divergence is not None:
             row["divergence"] = bool(s.divergence)
             row["div_ago"] = s.div_ago
-            if s.side == "buy" and s.divergence:
-                row["side"] = "强化买入"  # 一谷∩底背离（观察层）
+            if s.side == "buy":
+                row["side"] = buy_label(s.divergence, s.val_pct)
         if s.turnover is not None:
             row["turnover"] = s.turnover
         rows.append(row)
@@ -454,8 +589,8 @@ def annotate_rows_divergence(
         hit, ago = recent_pattern_hit(df, "底背离", lookback=lb)
         row["divergence"] = bool(hit)
         row["div_ago"] = ago if hit else None
-        if is_buy and hit and "强化" not in side:
-            row["side"] = "强化买入"
+        if is_buy:
+            row["side"] = buy_label(hit, row_val_pct(row))
         out.append(row)
     return out
 

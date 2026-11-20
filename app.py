@@ -306,6 +306,7 @@ def _gufeng_latest_csv():
 def _gufeng_read_csv(path_or_pair, side="all"):
     import csv
     from lib.data import drop_st_signals, is_st_name
+    from lib.gu_feng import buy_label, caution_of
 
     rows = []
     paths = []
@@ -358,8 +359,8 @@ def _gufeng_read_csv(path_or_pair, side="all"):
                 except Exception:
                     div_ago = None
                 side_out = side_raw or ("买入观察" if side == "buy" else "卖出观察")
-                if divergence and "买" in side_out and "强化" not in side_out:
-                    side_out = "强化买入"
+                if "买" in side_out and divergence is not None:
+                    side_out = buy_label(divergence, None if val_pct_pct is None else val_pct_pct / 100.0)
                 def _pf(key):
                     raw = rec.get(key)
                     if raw in (None, "", "None"):
@@ -388,6 +389,7 @@ def _gufeng_read_csv(path_or_pair, side="all"):
                     "metric": rec.get("metric") or "price_3y_pct",
                     "divergence": divergence,
                     "div_ago": div_ago,
+                    "caution": caution_of("买" in side_out, None if val_pct_pct is None else val_pct_pct / 100.0),
                 })
     rows = drop_st_signals(rows)
     # stable order: buys by pct asc, sells by pct desc
@@ -412,12 +414,11 @@ def _gufeng_run_scan():
         drop_st_signals,
         fetch_realtime_quotes,
         filter_mainboard,
-        is_st_name,
         list_cached_symbols,
         load_fundamentals,
         refresh_fund_names,
     )
-    from lib.gu_feng import scan_universe, signals_to_rows, refresh_target_buy
+    from lib.gu_feng import breadth_info, scan_universe, signals_to_rows, write_meta
     from lib.paths import OUTPUT
 
     with _GUFENG_STATE["lock"]:
@@ -431,31 +432,13 @@ def _gufeng_run_scan():
             pass
         fund = load_fundamentals(force=False)
         syms = filter_mainboard(list_cached_symbols(), fund=fund, drop_st=True)
-        buys, sells = scan_universe(syms, fund=fund, live={})
-        all_sigs = buys + sells
-        if all_sigs:
-            try:
-                live = fetch_realtime_quotes([s.sym for s in all_sigs])
-                kept_b, kept_s = [], []
-                for s in all_sigs:
-                    q = live.get(s.sym) or {}
-                    qn = str(q.get("name") or "").strip()
-                    if qn:
-                        s.name = qn
-                    if is_st_name(s.name):
-                        continue
-                    try:
-                        px = float(q.get("price") or q.get("px"))
-                        if px == px:
-                            s.price = round(px, 4)
-                            refresh_target_buy(s)
-                    except Exception:
-                        pass
-                    refresh_target_buy(s)
-                    (kept_b if s.side == "buy" else kept_s).append(s)
-                buys, sells = kept_b, kept_s
-            except Exception:
-                pass
+        # 先取全池实时快照再扫，分位/目标价/分档与参考价同一个价
+        try:
+            live = fetch_realtime_quotes(syms)
+        except Exception:
+            live = {}
+        scan_stats = {}
+        buys, sells = scan_universe(syms, fund=fund, live=live, stats=scan_stats)
         from lib.gu_feng import annotate_buy_turnover
         annotate_buy_turnover(buys, fund=fund)
         annotate_buy_turnover(sells, fund=fund)
@@ -477,7 +460,10 @@ def _gufeng_run_scan():
         _w(buy_path, buy_rows)
         _w(sell_path, sell_rows)
         _w(all_path, buy_rows + sell_rows)
+        breadth = breadth_info(len(buy_rows), scan_stats.get("n_scored"))
+        write_meta(all_path, {"n_scored": scan_stats.get("n_scored"), "n_buy": len(buy_rows), "n_sell": len(sell_rows), "breadth": breadth})
         payload = {
+            "breadth": breadth,
             "ok": True,
             "rows": buy_rows + sell_rows,
             "n_buy": len(buy_rows),
@@ -525,7 +511,10 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
         annotate_rows_turnover,
         clamp_div_lookback,
         enrich_rows_target_prices,
+        buy_label,
         filter_rows_by_turnover,
+        read_meta,
+        row_val_pct,
         resolve_turnover_max,
     )
 
@@ -570,7 +559,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
     def _apply_divergence(rows, source_key):
         """Annotate buy rows with 底背离; cache by source+lookback."""
         if not want_div:
-            return rows, 0, 0
+            return rows, 0, 0, 0
         cache_key = f"{source_key}|{div_days}"
         with _GUFENG_STATE["lock"]:
             cached = (_GUFENG_STATE.get("div_cache") or {}).get(cache_key)
@@ -587,8 +576,8 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
             else:
                 annotated = list(rows)
                 for r in annotated:
-                    if r.get("divergence") and "买" in str(r.get("side") or "") and "强化" not in str(r.get("side") or ""):
-                        r["side"] = "强化买入"
+                    if "买" in str(r.get("side") or ""):
+                        r["side"] = buy_label(r.get("divergence"), row_val_pct(r))
             with _GUFENG_STATE["lock"]:
                 dc = dict(_GUFENG_STATE.get("div_cache") or {})
                 dc[cache_key] = annotated
@@ -599,6 +588,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
                 _GUFENG_STATE["div_cache"] = dc
         n_buy_all = sum(1 for r in annotated if "买" in str(r.get("side") or ""))
         n_buy_div = sum(1 for r in annotated if r.get("divergence") and "买" in str(r.get("side") or ""))
+        n_buy_strong = sum(1 for r in annotated if r.get("side") == "强化买入")
         # 过滤：买侧只要强化；卖侧全留
         filtered = []
         for r in annotated:
@@ -608,7 +598,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
                     filtered.append(r)
             else:
                 filtered.append(r)
-        return filtered, n_buy_all, n_buy_div
+        return filtered, n_buy_all, n_buy_div, n_buy_strong
 
     def _apply_turnover(rows):
         """Annotate + filter buy side by turnover_max; return (rows, n_before, n_after)."""
@@ -631,7 +621,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
         if rows and all(r.get("buy_ceiling") is None for r in rows[: min(20, len(rows))]):
             rows = enrich_rows_target_prices(rows)
         source = cached_data.get("source") or "memory"
-        rows_div, n_buy_all, n_buy_div = _apply_divergence(rows, f"mem:{source}")
+        rows_div, n_buy_all, n_buy_div, n_buy_strong = _apply_divergence(rows, f"mem:{source}")
         base_rows = rows_div if want_div else rows
         rows_lt, n_lt_before, n_lt_after = _apply_turnover(base_rows)
         use_rows = rows_lt if want_lt else base_rows
@@ -647,6 +637,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
         out["n_sell"] = n_sell
         out["n_buy_all"] = n_buy_all if want_div else n_buy
         out["n_buy_div"] = n_buy_div if want_div else None
+        out["n_buy_strong"] = n_buy_strong if want_div else None
         out["n_buy_lt"] = n_lt_after if want_lt else None
         out["n_buy_lt_before"] = n_lt_before if want_lt else None
         out["divergence"] = want_div
@@ -658,7 +649,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
         out["scanning"] = False
         notes = []
         if want_div:
-            notes.append(f"买侧已叠加近{div_days}日底背离：强化买入 {n_buy_div}/{n_buy_all}")
+            notes.append(f"买侧已叠加近{div_days}日底背离：{n_buy_div}/{n_buy_all}，其中强化买入 {n_buy_strong}（深谷≤10%不升级）")
         if want_lt:
             notes.append(f"缩量换手<{to_max:g}%：{n_lt_after}/{n_lt_before}")
         if notes:
@@ -685,7 +676,8 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
         return {"ok": False, "error": str(e), "scanning": scanning, "rows": []}
 
     src_key = source if isinstance(source, str) else str(latest)
-    rows_div, n_buy_all, n_buy_div = _apply_divergence(all_rows, src_key)
+    meta = read_meta(latest) or {}
+    rows_div, n_buy_all, n_buy_div, n_buy_strong = _apply_divergence(all_rows, src_key)
     base_rows = rows_div if want_div else all_rows
     rows_lt, n_lt_before, n_lt_after = _apply_turnover(base_rows)
     use_rows = rows_lt if want_lt else base_rows
@@ -710,7 +702,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
     )
     bits = []
     if want_div:
-        bits.append(f"买侧叠加近{div_days}日底背离（一谷∩底背离→强化买入 {n_buy_div}/{n_buy_all}）")
+        bits.append(f"买侧叠加近{div_days}日底背离：{n_buy_div}/{n_buy_all}，其中强化买入 {n_buy_strong}（深谷≤10%不升级）")
     if want_lt:
         bits.append(f"缩量换手<{to_max:g}%（{n_lt_after}/{n_lt_before}）")
     if bits:
@@ -723,6 +715,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
         "n_sell": n_sell,
         "n_buy_all": n_buy_all if want_div else n_buy_file,
         "n_buy_div": n_buy_div if want_div else None,
+        "n_buy_strong": n_buy_strong if want_div else None,
         "n_buy_lt": n_lt_after if want_lt else None,
         "n_buy_lt_before": n_lt_before if want_lt else None,
         "n": len(use_rows),
@@ -733,6 +726,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
         "turnover_max": to_max if want_lt else None,
         "source": source,
         "mtime": mtime,
+        "breadth": meta.get("breadth"),
         "cached": True,
         "scanning": scanning,
         "scan_error": err,
@@ -744,7 +738,7 @@ def api_gufeng(side="all", rescan=False, divergence=False, div_days=5, low_turno
             "peak": "≥70% → 卖出观察",
             "target_buy": "买入上限=30%分位价；建议分批=20%分位价；在谷内目标买=现价",
             "sell_floor": "卖出参考=70%分位价（一峰下沿）",
-            "divergence": f"可选：近{div_days}日底背离叠加买侧（回测约+3pp）",
+            "divergence": f"可选：近{div_days}日底背离叠加买侧（回放约+1.2pp；深谷不升级强化）",
             "low_turnover": "可选：买侧换手率%<阈值（默认1%，回测一谷∧换手<1% win20≈71%）",
             "metric": "近3年自身收盘价分位（price_3y_pct）；目标价=历史分位映射非预测",
         },
@@ -1183,7 +1177,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div id="tab-gufeng" class="hidden">
-      <p class="note"><strong>估值谷峰 · 观察层</strong>：主板（含002）近3年自身价格分位 — <strong>一谷≤30% 买入观察</strong>、<strong>一峰≥70% 卖出观察</strong>、中间区观望。<strong>目标买入上限</strong>=30%分位价（一谷上沿），<strong>建议分批价</strong>=20%分位价；现价≤上限则目标买=现价（标注「现价已在一谷」）。目标价来自历史分位映射，<strong>不是预测必成交价</strong>。可选<strong>叠加底背离（买侧）</strong>：一谷∩近3～5日底背离→强化买入；可选<strong>缩量</strong>（换手&lt;1% 或 &lt;0.5%，基本面 turn）；二者可叠加；卖出一峰不变。已剔 ST/*ST、创业板300/301、科创688。<strong>非荐股</strong>。默认读最新 CSV；旧结果缺列时按缓存K线补算。</p>
+      <p class="note"><strong>估值谷峰 · 观察层</strong>：主板（含002）近3年自身价格分位 — <strong>一谷≤30% 买入观察</strong>、<strong>一峰≥70% 卖出观察</strong>、中间区观望。<strong>目标买入上限</strong>=30%分位价（一谷上沿），<strong>建议分批价</strong>=20%分位价；现价≤上限则目标买=现价（标注「现价已在一谷」）。目标价来自历史分位映射，<strong>不是预测必成交价</strong>。可选<strong>叠加底背离（买侧）</strong>：一谷∩近3～5日底背离→强化买入（深谷≤10%不升级：回放里深谷+底背离 60 日仍平均跑输同日约 2%）；可选<strong>缩量</strong>（换手&lt;1% 或 &lt;0.5%，基本面 turn）；二者可叠加；卖出一峰不变。已剔 ST/*ST、创业板300/301、科创688。<strong>非荐股</strong>。默认读最新 CSV；旧结果缺列时按缓存K线补算。</p>
       <div class="toolbar">
         <select id="gufengSide">
           <option value="all" selected>全部</option>
@@ -1208,6 +1202,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button onclick="doGufeng(true)">重新扫描（后台）</button>
         <span class="badge" id="gufengBadge">—</span>
       </div>
+      <div id="gufengBreadth" class="note"></div>
       <div id="gufengNote" class="note"></div>
       <div class="scroll"><table><thead><tr>
         <th>信号</th><th>代码</th><th>名称</th><th>参考价</th><th>目标买入</th><th>买入上限(30%)</th><th>分批价(20%)</th><th>卖参(70%)</th><th>分位%</th><th>换手%</th><th>PE</th><th>PB</th><th>底背离</th><th>截面日</th>
@@ -1454,7 +1449,7 @@ function fmtPct(v) {
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-async function doScan(force) {
+async function doScan(force, boot) {
   setBusy(true);
   try {
     const url = force ? '/api/scan?force=1' : '/api/scan';
@@ -1486,8 +1481,8 @@ async function doScan(force) {
       if (le) { le.textContent = light; le.className = 'value ' + lightClass(light); }
       setText('lightSub', `MA20=${g.above_ma20} · MA60=${g.above_ma60}`);
     }
-    // 默认停在联合信号；并异步算联合（红灯会很快返回0）
-    tab('joint');
+    // 默认停在联合信号；启动时用户已点过别的页签就不抢回来
+    if (!(boot && window._tabTouched)) tab('joint');
     doJoint();
   } catch (e) {
     alert('扫盘失败: ' + e);
@@ -2057,7 +2052,7 @@ async function doGufeng(rescan) {
     const nb = r.n_buy ?? 0, ns = r.n_sell ?? 0;
     let badge = '买' + nb + ' · 卖' + ns;
     if (r.divergence && r.n_buy_div != null) {
-      badge = '强化买' + r.n_buy_div + '/' + (r.n_buy_all ?? nb) + ' · 卖' + ns;
+      badge = '底背离' + r.n_buy_div + '/' + (r.n_buy_all ?? nb) + (r.n_buy_strong != null ? '（强化' + r.n_buy_strong + '）' : '') + ' · 卖' + ns;
     }
     if (r.low_turnover && r.n_buy_lt != null) {
       badge = '缩量买' + r.n_buy_lt + '/' + (r.n_buy_lt_before ?? nb) + ' · 卖' + ns;
@@ -2069,6 +2064,14 @@ async function doGufeng(rescan) {
       (r.scanning ? ' · 扫描中' : '')
     );
     setText('gufengNote', (r.note || '') + ' ' + (r.disclaimer || ''));
+    const br = r.breadth;
+    const brEl = $('gufengBreadth');
+    if (brEl) {
+      brEl.innerHTML = br
+        ? '<span class="' + (br.tier === 'low' ? 'pill warn' : 'pill') + '">全市场一谷占比 ' + (br.share * 100).toFixed(1) + '%</span> ' +
+          esc(br.n_buy + '/' + br.n_scored + ' 只 · ' + br.text + '（只作参考，不参与筛选）')
+        : '全市场一谷占比：这份结果是旧版扫描生成的，点「重新扫描」后显示';
+    }
     const rows = r.rows || [];
     const tb = $('tbody-gufeng');
     if (!tb) return;
@@ -2088,7 +2091,8 @@ async function doGufeng(rescan) {
         let tbCell = fmtPx(x.target_buy);
         if (x.target_note) tbCell += '<div style="font-size:11px;opacity:.75">' + esc(x.target_note) + '</div>';
         return '<tr>' +
-          '<td><span class="' + pill + '">' + esc(x.side) + '</span></td>' +
+          '<td><span class="' + pill + '">' + esc(x.side) + '</span>' +
+            (x.caution ? '<div style="margin-top:4px"><span class="pill warn" style="white-space:nowrap">' + esc(x.caution) + '</span></div>' : '') + '</td>' +
           '<td class="num">' + esc(x.code || x.sym) + '</td>' +
           '<td>' + esc(x.name) + '</td>' +
           '<td class="num">' + fmtPx(x.ref_price) + '</td>' +
@@ -2127,13 +2131,19 @@ function tab(name) {
     doGufeng(false);
   }
 }
-loadStatus().then(() => doScan(false)).then(() => doAction()).then(() => setupAutoLive());
+document.addEventListener('click', e => { if (e.target.closest('[data-tab]')) window._tabTouched = true; }, true);
+loadStatus().then(() => doScan(false, true)).then(() => doAction()).then(() => setupAutoLive());
 const _autoEl = document.getElementById('autoLive');
 if (_autoEl) _autoEl.addEventListener('change', setupAutoLive);
 </script>
 </body>
 </html>
 """
+
+
+def should_open_browser() -> bool:
+    # 软件拉起时设 QUANT_NO_BROWSER=1，避免和启动器各开一次浏览器。
+    return os.environ.get("QUANT_NO_BROWSER") != "1"
 
 
 def main():
@@ -2146,7 +2156,8 @@ def main():
     print("  停止: Ctrl+C")
     print("=" * 50)
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    if should_open_browser():
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

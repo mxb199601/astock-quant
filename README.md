@@ -98,7 +98,17 @@ $PY cli.py backtest --mode dual_mom   # 单公式回测
 
 验证：`for t in scripts/test_*.py; do /Users/meng/测试/.venv/bin/python "$t" || break; done`（全部脚本退出码 0 为过门）
 
-### Web 系统（推荐）
+### 应用程序（不用再启动后端）
+
+「量化研究」在访达的「应用程序」里，Spotlight 搜这个名字也能打开。双击后它自己拉起页面并打开浏览器，地址是 http://127.0.0.1:8765 。已经在跑时再打开，只切到页面，不会再起一个服务。从程序坞退出，页面服务会停；下次双击会再拉起来。
+
+重新装到本机：
+
+```bash
+bash /Users/meng/测试/量化工具/scripts/build_quant_app.sh
+```
+
+终端里手动起（软件内部也是这条，并带上 `QUANT_NO_BROWSER=1`）：
 
 ```bash
 cd /Users/meng/测试/量化工具

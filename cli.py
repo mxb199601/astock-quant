@@ -1136,7 +1136,6 @@ def cmd_gufeng(args):
         drop_st_signals,
         fetch_realtime_quotes,
         filter_mainboard,
-        is_st_name,
         list_cached_symbols,
         load_fundamentals,
         load_kline_csv,
@@ -1144,7 +1143,7 @@ def cmd_gufeng(args):
         resolve_name,
         to_sym,
     )
-    from lib.gu_feng import scan_universe, score_symbol, signals_to_rows, refresh_target_buy, compute_target_levels, TARGET_CSV_FIELDS
+    from lib.gu_feng import assess, breadth_info, live_quote, scan_universe, signals_to_rows, write_meta
     from lib.paths import OUTPUT
 
     valley = float(args.valley)
@@ -1181,26 +1180,13 @@ def cmd_gufeng(args):
                 pb = float(pb) if pb is not None else None
             except Exception:
                 pb = None
-            live_px = None
-            if sym in live:
-                try:
-                    live_px = float(live[sym].get("price") or live[sym].get("px"))
-                except Exception:
-                    live_px = None
-            # force classify even mid zone for display
-            from lib.gu_feng import latest_past_percentile
-            import numpy as np
-            d = df.sort_values("date")
-            close = d["close"].astype(float).to_numpy()
-            vp = latest_past_percentile(close)
-            px = live_px if live_px is not None else float(close[-1])
-            if vp <= valley:
-                zone = "一谷·买入观察"
-            elif vp >= peak:
-                zone = "一峰·卖出观察"
-            else:
-                zone = "中间区·观望"
-            levels = compute_target_levels(close, px, valley=valley, peak=peak)
+            live_px, live_date = live_quote(live.get(sym))
+            a = assess(df, live_px=live_px, live_date=live_date, valley=valley, peak=peak)
+            if a is None:
+                print(f"{sym}: 近3年历史不足，无法算分位")
+                continue
+            vp, px, levels = a["val_pct"], a["price"], a["levels"]
+            zone = {"buy": "一谷·买入观察", "sell": "一峰·卖出观察"}.get(a["zone"], "中间区·观望")
             tb = levels.get("target_buy")
             bc = levels.get("buy_ceiling")
             bp = levels.get("buy_prefer")
@@ -1209,7 +1195,7 @@ def cmd_gufeng(args):
             print(
                 f"{sym} {name}  {zone}  分位={vp*100:.1f}%  参考价={px:.4f}  "
                 f"目标买入={tb}({tn}) 上限(30%)={bc} 分批(20%)={bp} 卖参(70%)={sf}  "
-                f"PE={pe} PB={pb}  asof={str(d['date'].iloc[-1])[:10]}"
+                f"PE={pe} PB={pb}  asof={a['asof']}"
             )
         print("研究用，不构成投资建议。")
         return 0
@@ -1219,45 +1205,16 @@ def cmd_gufeng(args):
     if args.limit and args.limit > 0:
         syms = syms[: int(args.limit)]
     print(f"=== 估值一谷一峰扫描 === 池={len(syms)} valley≤{valley:.0%} peak≥{peak:.0%}")
+    # 先取全池实时快照再扫：盘中跌进/冲出一谷的票按实时价分档；--no-live 只用实时简称做 ST 校验
     live = {}
-    if not args.no_live:
-        try:
-            # batch live for speed: only after scan on signal names; skip pre-fetch all
-            pass
-        except Exception:
-            pass
-    buys, sells = scan_universe(syms, valley=valley, peak=peak, fund=fund, live={})
-    # attach live prices + 候选名单二次校验最新简称（防缓存仍滞后）
-    all_sigs = buys + sells
-    if all_sigs:
-        try:
-            live = fetch_realtime_quotes([s.sym for s in all_sigs])
-            kept_buys, kept_sells = [], []
-            dropped_st = []
-            for s in all_sigs:
-                q = live.get(s.sym) or {}
-                qn = str(q.get("name") or "").strip()
-                if qn:
-                    s.name = qn
-                if is_st_name(s.name):
-                    dropped_st.append(f"{s.sym}:{s.name}")
-                    continue
-                if not args.no_live:
-                    try:
-                        px = float(q.get("price") or q.get("px"))
-                        if px == px:
-                            s.price = round(px, 4)
-                            refresh_target_buy(s)
-                    except Exception:
-                        pass
-                else:
-                    refresh_target_buy(s)
-                (kept_buys if s.side == "buy" else kept_sells).append(s)
-            buys, sells = kept_buys, kept_sells
-            if dropped_st:
-                print(f"(二次校验剔除 ST {len(dropped_st)}: {', '.join(dropped_st[:8])}{'…' if len(dropped_st)>8 else ''})")
-        except Exception as e:
-            print(f"(实时价/ST二次校验跳过: {e})")
+    try:
+        live = fetch_realtime_quotes(syms)
+        if args.no_live:
+            live = {k: {"name": v.get("name")} for k, v in live.items()}
+    except Exception as e:
+        print(f"(实时价/ST校验跳过: {e})")
+    scan_stats = {}
+    buys, sells = scan_universe(syms, valley=valley, peak=peak, fund=fund, live=live, stats=scan_stats)
 
     # 买侧可选：近 3～5 日底背离 → 强化买入（不与放量/金叉等做 AND）
     use_div = bool(getattr(args, "divergence", False))
@@ -1309,6 +1266,8 @@ def cmd_gufeng(args):
     _w(buy_path, buy_rows)
     _w(sell_path, sell_rows)
     _w(all_path, buy_rows + sell_rows)
+    breadth = breadth_info(len(buy_rows), scan_stats.get("n_scored"))
+    write_meta(all_path, {"n_scored": scan_stats.get("n_scored"), "n_buy": len(buy_rows), "n_sell": len(sell_rows), "breadth": breadth})
     div_path = None
     lt_path = None
     if use_div:
@@ -1356,6 +1315,8 @@ def cmd_gufeng(args):
                 dflag = "Y" if r.get("divergence") else "-"
                 ago = "" if r.get("div_ago") is None else str(r.get("div_ago"))
                 line += f" {dflag:>4s} {ago:>4s}"
+            if r.get("caution"):
+                line += f"  {r['caution']}"
             print(line)
         print("  *目标买=现价表示「现价已在一谷」；上限=30%分位价，分批=20%分位价（历史映射非预测）")
         if len(rows) > n:
@@ -1363,7 +1324,7 @@ def cmd_gufeng(args):
 
     if use_lt:
         title_lt = (
-            "缩量强化买入（一谷∩近{}日底背离∩换手<{:.3g}%）".format(div_days, to_max)
+            "一谷∩近{}日底背离∩换手<{:.3g}%（深谷≤10%不算强化）".format(div_days, to_max)
             if use_div
             else "缩量买入观察（一谷∩换手<{:.3g}%）".format(to_max)
         )
@@ -1371,7 +1332,7 @@ def cmd_gufeng(args):
         print(f"  对照：叠缩量前 {n_focus_before} → 后 {len(buy_lt_rows)}（阈值换手<{to_max:g}%）")
     if use_div:
         _show(
-            "强化买入（一谷∩近{}日底背离）".format(div_days),
+            "一谷∩近{}日底背离（深谷≤10%标慎接、不算强化）".format(div_days),
             buy_div_rows,
             args.top if not use_lt else min(args.top, 15),
             show_div=True,
@@ -1388,6 +1349,11 @@ def cmd_gufeng(args):
     elif not use_lt:
         _show("买入观察（一谷 分位≤{:.0%}）".format(valley), buy_rows, args.top, show_turn=True)
     _show("卖出观察（一峰 分位≥{:.0%}）".format(peak), sell_rows, args.top, show_turn=False)
+    if breadth:
+        print(
+            f"\n全市场一谷占比 {breadth['share']*100:.1f}%（{breadth['n_buy']}/{breadth['n_scored']}）："
+            f"{breadth['text']}"
+        )
     print(f"\n→ {buy_path}")
     print(f"→ {sell_path}")
     print(f"→ {all_path}")

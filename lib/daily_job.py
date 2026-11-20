@@ -282,6 +282,24 @@ def run_daily(
     except Exception as e:
         log(f"   破戒检查失败: {e}")
         disc_r = {"ok": False, "error": str(e)}
+
+    # 页面「估值谷峰」只读最新 gufeng_all_*.csv；不在日更里重扫，参考价会一直停在上次手动扫描那天。
+    log("3f) 估值谷峰扫描…")
+    try:
+        gf = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "cli.py"), "gufeng"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        gf_out = [ln for ln in (gf.stdout or "").splitlines() if "gufeng_all_" in ln]
+        if gf.returncode == 0:
+            log(f"   谷峰 {gf_out[-1].strip() if gf_out else '完成'}")
+        else:
+            log(f"   谷峰扫描失败 exit={gf.returncode}: {(gf.stderr or '').strip()[-300:]}")
+    except Exception as e:
+        log(f"   谷峰扫描失败: {e}")
     # 追加联合信号 / MENGα / 形态 / 妖股到报告
     try:
         with open(report, "a", encoding="utf-8") as f:
